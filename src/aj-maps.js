@@ -12,7 +12,8 @@ class AJMap {
             zoom: options.zoom || 13,
             minZoom: options.minZoom || 3,
             maxZoom: options.maxZoom || 19,
-            tileSize: 256
+            tileSize: 256,
+            mode: options.mode || '2d' // '2d' or '3d'
         };
         
         this.zoom = this.options.zoom;
@@ -24,6 +25,11 @@ class AJMap {
         this.currentLayer = 'streets';
         this.routePolyline = null;
         this.darkMode = false;
+        
+        // 3D specific properties
+        this.mode = this.options.mode;
+        this.pitch = 0; // Tilt angle (0-60 degrees)
+        this.bearing = 0; // Rotation angle (0-360 degrees)
         
         this.init();
     }
@@ -138,6 +144,11 @@ class AJMap {
             this.ctx.filter = 'none';
         }
         
+        if (this.mode === '3d') {
+            this._render3D();
+            return;
+        }
+        
         const centerPixel = this._latLngToPixel(this.center.lat, this.center.lng);
         const offsetX = this.canvas.width / 2 - centerPixel.x;
         const offsetY = this.canvas.height / 2 - centerPixel.y;
@@ -189,7 +200,13 @@ class AJMap {
         // Mouse drag
         this.canvas.addEventListener('mousedown', (e) => {
             this.isDragging = true;
-            this.dragStart = { x: e.clientX, y: e.clientY, center: { ...this.center } };
+            this.dragStart = { 
+                x: e.clientX, 
+                y: e.clientY, 
+                center: { ...this.center },
+                bearing: this.bearing,
+                pitch: this.pitch
+            };
             this.canvas.style.cursor = 'grabbing';
         });
         
@@ -199,15 +216,22 @@ class AJMap {
             const dx = e.clientX - this.dragStart.x;
             const dy = e.clientY - this.dragStart.y;
             
-            const scale = Math.pow(2, this.zoom) * this.options.tileSize;
-            const dLng = -dx / scale * 360;
-            const centerY = this._latToY(this.dragStart.center.lat) + dy / scale;
-            const dLat = this._pixelToLat(centerY * Math.pow(2, this.zoom) * this.options.tileSize);
-            
-            this.center = {
-                lat: dLat,
-                lng: this.dragStart.center.lng + dLng
-            };
+            if (this.mode === '3d') {
+                // In 3D mode, rotate the globe
+                this.bearing = this.dragStart.bearing - dx * 0.3;
+                this.pitch = Math.max(0, Math.min(60, this.dragStart.pitch + dy * 0.2));
+            } else {
+                // 2D panning
+                const scale = Math.pow(2, this.zoom) * this.options.tileSize;
+                const dLng = -dx / scale * 360;
+                const centerY = this._latToY(this.dragStart.center.lat) + dy / scale;
+                const dLat = this._pixelToLat(centerY * Math.pow(2, this.zoom) * this.options.tileSize);
+                
+                this.center = {
+                    lat: dLat,
+                    lng: this.dragStart.center.lng + dLng
+                };
+            }
             
             this._render();
         });
@@ -313,6 +337,7 @@ class AJMap {
         const controls = document.createElement('div');
         controls.className = 'aj-controls-container';
         controls.innerHTML = `
+            <button class="aj-fab" id="${this.containerId}-3d" title="Toggle 3D/Globe View">🌐</button>
             <button class="aj-fab" id="${this.containerId}-mode" title="Toggle Dark Mode">🌙</button>
             <button class="aj-fab" id="${this.containerId}-loc" title="My Location">📍</button>
             <button class="aj-fab" id="${this.containerId}-in" title="Zoom In">+</button>
@@ -324,6 +349,7 @@ class AJMap {
         document.getElementById(`${this.containerId}-out`).onclick = () => this.zoomOut();
         document.getElementById(`${this.containerId}-loc`).onclick = () => this._locateUser();
         document.getElementById(`${this.containerId}-mode`).onclick = () => this.toggleDarkMode();
+        document.getElementById(`${this.containerId}-3d`).onclick = () => this.toggle3D();
         
         // Layer Switcher
         const layerSwitch = document.createElement('div');
@@ -647,6 +673,208 @@ class AJMap {
     clearRoute() {
         this.routePolyline = null;
         this._render();
+    }
+
+    // 3D Mode Methods
+    
+    toggle3D() {
+        this.mode = this.mode === '2d' ? '3d' : '2d';
+        
+        if (this.mode === '3d') {
+            this.pitch = 45; // Initial tilt
+            this.zoom = Math.max(3, this.zoom - 2); // Zoom out for better globe view
+        } else {
+            this.pitch = 0;
+            this.bearing = 0;
+        }
+        
+        this.tiles.clear();
+        this._render();
+    }
+
+    _render3D() {
+        const ctx = this.ctx;
+        const width = this.canvas.width;
+        const height = this.canvas.height;
+        
+        // Draw globe background
+        const gradient = ctx.createRadialGradient(
+            width/2, height/2, 0,
+            width/2, height/2, Math.min(width, height) / 2
+        );
+        gradient.addColorStop(0, '#4a90e2');
+        gradient.addColorStop(0.7, '#2c5aa0');
+        gradient.addColorStop(1, '#1a1a2e');
+        
+        ctx.fillStyle = gradient;
+        ctx.beginPath();
+        ctx.arc(width/2, height/2, Math.min(width, height) / 2.2, 0, Math.PI * 2);
+        ctx.fill();
+        
+        // Sphere parameters
+        const radius = Math.min(width, height) / 2.2;
+        const centerX = width / 2;
+        const centerY = height / 2;
+        
+        // Draw tiles on sphere
+        const numTiles = Math.pow(2, Math.min(this.zoom, 5)); // Limit for performance
+        const tileAngleStep = 360 / numTiles;
+        
+        // Calculate visible tiles based on center and bearing
+        for (let latIdx = 0; latIdx < 8; latIdx++) {
+            for (let lngIdx = 0; lngIdx < numTiles; lngIdx++) {
+                const lat = 85 - (latIdx * 170 / 8);
+                const lng = -180 + (lngIdx * 360 / numTiles) + this.bearing;
+                
+                // Check if tile is on visible side of globe
+                const adjustedLng = lng - this.center.lng;
+                if (Math.abs(adjustedLng) > 90) continue;
+                
+                // Convert lat/lng to sphere coordinates
+                const phi = (90 - lat) * Math.PI / 180;
+                const theta = ((lng - this.center.lng) * Math.PI / 180);
+                
+                const x = radius * Math.sin(phi) * Math.sin(theta);
+                const y = radius * Math.cos(phi) * Math.cos(this.pitch * Math.PI / 180) - 
+                         radius * Math.sin(phi) * Math.cos(theta) * Math.sin(this.pitch * Math.PI / 180);
+                const z = radius * Math.sin(phi) * Math.cos(theta) * Math.cos(this.pitch * Math.PI / 180) + 
+                         radius * Math.cos(phi) * Math.sin(this.pitch * Math.PI / 180);
+                
+                // Only draw front-facing tiles
+                if (z > 0) {
+                    const screenX = centerX + x;
+                    const screenY = centerY - y;
+                    
+                    // Calculate tile coordinates
+                    const tileZoom = Math.min(Math.floor(this.zoom / 2), 5);
+                    const tileX = Math.floor((lng + 180) / 360 * Math.pow(2, tileZoom));
+                    const tileY = Math.floor((1 - Math.log(Math.tan(lat * Math.PI / 180) + 1 / Math.cos(lat * Math.PI / 180)) / Math.PI) / 2 * Math.pow(2, tileZoom));
+                    
+                    if (tileX >= 0 && tileX < Math.pow(2, tileZoom) && tileY >= 0 && tileY < Math.pow(2, tileZoom)) {
+                        const tile = this._loadTile(tileX, tileY, tileZoom, this.currentLayer);
+                        
+                        if (tile.loaded) {
+                            // Calculate tile size based on perspective
+                            const scale = 1 / (1 + z / radius * 0.5);
+                            const tileSize = 60 * scale;
+                            
+                            ctx.save();
+                            ctx.globalAlpha = Math.max(0.3, 1 - z / radius);
+                            ctx.drawImage(
+                                tile.img,
+                                screenX - tileSize/2,
+                                screenY - tileSize/2,
+                                tileSize,
+                                tileSize
+                            );
+                            ctx.restore();
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Draw country borders/grid
+        ctx.strokeStyle = this.darkMode ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)';
+        ctx.lineWidth = 1;
+        
+        // Latitude lines
+        for (let lat = -80; lat <= 80; lat += 20) {
+            ctx.beginPath();
+            for (let lng = -180; lng <= 180; lng += 5) {
+                const adjustedLng = lng - this.center.lng + this.bearing;
+                if (Math.abs(adjustedLng) > 90) continue;
+                
+                const phi = (90 - lat) * Math.PI / 180;
+                const theta = adjustedLng * Math.PI / 180;
+                
+                const x = radius * Math.sin(phi) * Math.sin(theta);
+                const y = radius * Math.cos(phi) * Math.cos(this.pitch * Math.PI / 180) - 
+                         radius * Math.sin(phi) * Math.cos(theta) * Math.sin(this.pitch * Math.PI / 180);
+                const z = radius * Math.sin(phi) * Math.cos(theta) * Math.cos(this.pitch * Math.PI / 180) + 
+                         radius * Math.cos(phi) * Math.sin(this.pitch * Math.PI / 180);
+                
+                if (z > 0) {
+                    const screenX = centerX + x;
+                    const screenY = centerY - y;
+                    if (lng === -180) ctx.moveTo(screenX, screenY);
+                    else ctx.lineTo(screenX, screenY);
+                }
+            }
+            ctx.stroke();
+        }
+        
+        // Longitude lines
+        for (let lng = -180; lng <= 180; lng += 30) {
+            ctx.beginPath();
+            for (let lat = -85; lat <= 85; lat += 5) {
+                const adjustedLng = lng - this.center.lng + this.bearing;
+                if (Math.abs(adjustedLng) > 90) continue;
+                
+                const phi = (90 - lat) * Math.PI / 180;
+                const theta = adjustedLng * Math.PI / 180;
+                
+                const x = radius * Math.sin(phi) * Math.sin(theta);
+                const y = radius * Math.cos(phi) * Math.cos(this.pitch * Math.PI / 180) - 
+                         radius * Math.sin(phi) * Math.cos(theta) * Math.sin(this.pitch * Math.PI / 180);
+                const z = radius * Math.sin(phi) * Math.cos(theta) * Math.cos(this.pitch * Math.PI / 180) + 
+                         radius * Math.cos(phi) * Math.sin(this.pitch * Math.PI / 180);
+                
+                if (z > 0) {
+                    const screenX = centerX + x;
+                    const screenY = centerY - y;
+                    if (lat === -85) ctx.moveTo(screenX, screenY);
+                    else ctx.lineTo(screenX, screenY);
+                }
+            }
+            ctx.stroke();
+        }
+        
+        // Add atmosphere glow
+        const glowGradient = ctx.createRadialGradient(
+            width/2, height/2, radius * 0.9,
+            width/2, height/2, radius * 1.1
+        );
+        glowGradient.addColorStop(0, 'rgba(135, 206, 250, 0)');
+        glowGradient.addColorStop(1, 'rgba(135, 206, 250, 0.3)');
+        
+        ctx.fillStyle = glowGradient;
+        ctx.beginPath();
+        ctx.arc(width/2, height/2, radius * 1.1, 0, Math.PI * 2);
+        ctx.fill();
+        
+        this.ctx.filter = 'none';
+        this._updateMarkers();
+    }
+
+    setPitch(angle) {
+        this.pitch = Math.max(0, Math.min(60, angle));
+        this._render();
+    }
+
+    setBearing(angle) {
+        this.bearing = angle % 360;
+        this._render();
+    }
+
+    rotateTo(bearing, duration = 1000) {
+        const start = this.bearing;
+        const end = bearing;
+        const startTime = Date.now();
+        
+        const animate = () => {
+            const elapsed = Date.now() - startTime;
+            const progress = Math.min(elapsed / duration, 1);
+            
+            this.bearing = start + (end - start) * progress;
+            this._render();
+            
+            if (progress < 1) {
+                requestAnimationFrame(animate);
+            }
+        };
+        
+        animate();
     }
 }
 

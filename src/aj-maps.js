@@ -21,10 +21,16 @@ class AJMap {
         this.isDragging = false;
         this.dragStart = null;
         this.tiles = new Map();
+        this.tileCache = new Map(); // Persistent cache (up to 800 tiles)
+        this.loadingTiles = new Set(); // Track active loads
+        this.tileQueue = []; // Priority queue for loading
         this.markers = [];
         this.currentLayer = 'streets';
         this.routePolyline = null;
         this.darkMode = false;
+        this.lastRenderTime = 0;
+        this.renderThrottle = 16; // 60fps throttle
+        this.pendingRender = null;
         
         // 3D specific properties
         this.mode = this.options.mode;
@@ -86,6 +92,22 @@ class AJMap {
         this.displayWidth = rect.width;
         this.displayHeight = rect.height;
     }
+    
+    _scheduleRender() {
+        const now = Date.now();
+        if (now - this.lastRenderTime < this.renderThrottle) {
+            if (!this.renderScheduled) {
+                this.renderScheduled = true;
+                requestAnimationFrame(() => {
+                    this.renderScheduled = false;
+                    this._render();
+                });
+            }
+            return;
+        }
+        this.lastRenderTime = now;
+        this._render();
+    }
 
     // Web Mercator Projection
     _latToY(lat) {
@@ -115,38 +137,105 @@ class AJMap {
     }
 
     _getTileURL(x, y, z, layer = 'streets') {
-        const servers = ['a', 'b', 'c'];
-        const s = servers[Math.abs(x + y) % 3];
+        // Multiple CDN providers for ultra-fast worldwide access
+        const cdnIndex = Math.abs(x + y + z) % 4;
         
         if (layer === 'satellite') {
-            return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+            const servers = [
+                'server.arcgisonline.com',
+                'services.arcgisonline.com'
+            ];
+            const server = servers[cdnIndex % 2];
+            return `https://${server}/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
         } else if (layer === 'labels') {
-            return `https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/${z}/${y}/${x}`;
+            const servers = [
+                'server.arcgisonline.com',
+                'services.arcgisonline.com'
+            ];
+            const server = servers[cdnIndex % 2];
+            return `https://${server}/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/${z}/${y}/${x}`;
         } else {
+            // 4 CartoDB CDN servers for parallel loading
+            const servers = ['a', 'b', 'c', 'd'];
+            const s = servers[cdnIndex];
             return `https://${s}.basemaps.cartocdn.com/rastertiles/voyager/${z}/${x}/${y}.png`;
         }
     }
 
-    _loadTile(x, y, z, layer) {
+    _loadTile(x, y, z, layer, priority = 0) {
         const key = `${layer}-${z}-${x}-${y}`;
         
+        // Check cache first (persistent across renders)
+        if (this.tileCache.has(key)) {
+            const cached = this.tileCache.get(key);
+            if (cached.loaded) return cached;
+        }
+        
+        // Return existing tile if already loaded
         if (this.tiles.has(key)) {
             return this.tiles.get(key);
         }
         
+        // Skip if already loading
+        if (this.loadingTiles.has(key)) {
+            return { img: null, loaded: false };
+        }
+        
+        this.loadingTiles.add(key);
+        
         const img = new Image();
         img.crossOrigin = 'anonymous';
-        img.src = this._getTileURL(x, y, z, layer);
+        img.decoding = 'async'; // Async decoding for better performance
         
-        const tileData = { img, loaded: false };
+        const tileData = { img, loaded: false, priority };
         this.tiles.set(key, tileData);
         
         img.onload = () => {
             tileData.loaded = true;
-            this._render();
+            this.loadingTiles.delete(key);
+            
+            // Move to cache
+            this.tileCache.set(key, tileData);
+            
+            // Limit cache size (keep last 800 tiles, ~50MB)
+            if (this.tileCache.size > 800) {
+                const oldestKey = this.tileCache.keys().next().value;
+                this.tileCache.delete(oldestKey);
+            }
+            
+            this._scheduleRender();
         };
         
+        img.onerror = () => {
+            this.loadingTiles.delete(key);
+            // Retry with different CDN on error
+            setTimeout(() => {
+                if (!this.tiles.has(key) || !this.tiles.get(key).loaded) {
+                    img.src = this._getTileURL(x, y, z, layer);
+                }
+            }, 1000);
+        };
+        
+        img.src = this._getTileURL(x, y, z, layer);
         return tileData;
+    }
+    
+    _scheduleRender() {
+        if (this.pendingRender) return;
+        
+        const now = Date.now();
+        const timeSinceLastRender = now - this.lastRenderTime;
+        
+        if (timeSinceLastRender >= this.renderThrottle) {
+            this.lastRenderTime = now;
+            this._render();
+        } else {
+            this.pendingRender = setTimeout(() => {
+                this.pendingRender = null;
+                this.lastRenderTime = Date.now();
+                this._render();
+            }, this.renderThrottle - timeSinceLastRender);
+        }
     }
 
     _render() {
@@ -177,34 +266,59 @@ class AJMap {
         const endTileX = Math.ceil((centerPixel.x + width / 2) / this.options.tileSize);
         const endTileY = Math.ceil((centerPixel.y + height / 2) / this.options.tileSize);
         
-        // Draw base layer
+        // Calculate center tile for priority loading
+        const centerTileX = Math.floor((startTileX + endTileX) / 2);
+        const centerTileY = Math.floor((startTileY + endTileY) / 2);
+        
+        // Create tile list with priorities (center tiles first)
+        const tilesToLoad = [];
         for (let ty = startTileY; ty <= endTileY; ty++) {
             for (let tx = startTileX; tx <= endTileX; tx++) {
                 if (tx < 0 || tx >= numTiles || ty < 0 || ty >= numTiles) continue;
-                
-                const tile = this._loadTile(tx, ty, this.zoom, this.currentLayer);
-                if (tile.loaded) {
-                    const x = tx * this.options.tileSize + offsetX;
-                    const y = ty * this.options.tileSize + offsetY;
-                    this.ctx.drawImage(tile.img, x, y, this.options.tileSize, this.options.tileSize);
+                const distance = Math.abs(tx - centerTileX) + Math.abs(ty - centerTileY);
+                tilesToLoad.push({ tx, ty, distance });
+            }
+        }
+        
+        // Sort by distance from center (load center tiles first)
+        tilesToLoad.sort((a, b) => a.distance - b.distance);
+        
+        // Draw base layer with priority
+        for (const tileInfo of tilesToLoad) {
+            const tile = this._loadTile(tileInfo.tx, tileInfo.ty, this.zoom, this.currentLayer, -tileInfo.distance);
+            if (tile.loaded) {
+                const x = tileInfo.tx * this.options.tileSize + offsetX;
+                const y = tileInfo.ty * this.options.tileSize + offsetY;
+                this.ctx.drawImage(tile.img, x, y, this.options.tileSize, this.options.tileSize);
+            }
+        }
+        
+        // Preload next zoom level for smooth zooming (only center 4 tiles)
+        if (this.zoom < this.options.maxZoom - 1) {
+            for (let i = 0; i < Math.min(4, tilesToLoad.length); i++) {
+                const t = tilesToLoad[i];
+                this._loadTile(t.tx * 2, t.ty * 2, this.zoom + 1, this.currentLayer, -100);
+                this._loadTile(t.tx * 2 + 1, t.ty * 2, this.zoom + 1, this.currentLayer, -101);
+                this._loadTile(t.tx * 2, t.ty * 2 + 1, this.zoom + 1, this.currentLayer, -102);
+                this._loadTile(t.tx * 2 + 1, t.ty * 2 + 1, this.zoom + 1, this.currentLayer, -103);
+            }
+        }
+        
+        // Draw labels if satellite mode (with same priority)
+        if (this.currentLayer === 'satellite') {
+            for (const tileInfo of tilesToLoad) {
+                const labelTile = this._loadTile(tileInfo.tx, tileInfo.ty, this.zoom, 'labels', -tileInfo.distance);
+                if (labelTile.loaded) {
+                    const x = tileInfo.tx * this.options.tileSize + offsetX;
+                    const y = tileInfo.ty * this.options.tileSize + offsetY;
+                    this.ctx.drawImage(labelTile.img, x, y, this.options.tileSize, this.options.tileSize);
                 }
             }
         }
         
-        // Draw labels if satellite mode
-        if (this.currentLayer === 'satellite') {
-            for (let ty = startTileY; ty <= endTileY; ty++) {
-                for (let tx = startTileX; tx <= endTileX; tx++) {
-                    if (tx < 0 || tx >= numTiles || ty < 0 || ty >= numTiles) continue;
-                    
-                    const labelTile = this._loadTile(tx, ty, this.zoom, 'labels');
-                    if (labelTile.loaded) {
-                        const x = tx * this.options.tileSize + offsetX;
-                        const y = ty * this.options.tileSize + offsetY;
-                        this.ctx.drawImage(labelTile.img, x, y, this.options.tileSize, this.options.tileSize);
-                    }
-                }
-            }
+        // Render major city labels for better navigation
+        if (this.zoom >= 4 && this.currentLayer === 'streets') {
+            this._renderCityLabels(offsetX, offsetY);
         }
         
         this.ctx.filter = 'none';
@@ -212,6 +326,78 @@ class AJMap {
         // Update marker positions
         this._updateMarkers();
         this._updateRoute();
+    }
+    
+    _renderCityLabels(offsetX, offsetY) {
+        // Major world cities for better UX
+        const cities = [
+            { name: 'New York', lat: 40.7128, lng: -74.0060, minZoom: 4 },
+            { name: 'London', lat: 51.5074, lng: -0.1278, minZoom: 4 },
+            { name: 'Paris', lat: 48.8566, lng: 2.3522, minZoom: 4 },
+            { name: 'Tokyo', lat: 35.6762, lng: 139.6503, minZoom: 4 },
+            { name: 'Dubai', lat: 25.2048, lng: 55.2708, minZoom: 4 },
+            { name: 'Singapore', lat: 1.3521, lng: 103.8198, minZoom: 4 },
+            { name: 'Sydney', lat: -33.8688, lng: 151.2093, minZoom: 4 },
+            { name: 'Los Angeles', lat: 34.0522, lng: -118.2437, minZoom: 5 },
+            { name: 'Chicago', lat: 41.8781, lng: -87.6298, minZoom: 5 },
+            { name: 'Toronto', lat: 43.6532, lng: -79.3832, minZoom: 5 },
+            { name: 'Berlin', lat: 52.5200, lng: 13.4050, minZoom: 5 },
+            { name: 'Moscow', lat: 55.7558, lng: 37.6173, minZoom: 5 },
+            { name: 'Beijing', lat: 39.9042, lng: 116.4074, minZoom: 5 },
+            { name: 'Shanghai', lat: 31.2304, lng: 121.4737, minZoom: 5 },
+            { name: 'Mumbai', lat: 19.0760, lng: 72.8777, minZoom: 5 },
+            { name: 'Delhi', lat: 28.7041, lng: 77.1025, minZoom: 5 },
+            { name: 'São Paulo', lat: -23.5505, lng: -46.6333, minZoom: 5 },
+            { name: 'Mexico City', lat: 19.4326, lng: -99.1332, minZoom: 5 },
+            { name: 'Cairo', lat: 30.0444, lng: 31.2357, minZoom: 5 },
+            { name: 'Istanbul', lat: 41.0082, lng: 28.9784, minZoom: 5 },
+            { name: 'Bangkok', lat: 13.7563, lng: 100.5018, minZoom: 5 },
+            { name: 'Seoul', lat: 37.5665, lng: 126.9780, minZoom: 5 },
+            { name: 'Hong Kong', lat: 22.3193, lng: 114.1694, minZoom: 5 },
+            { name: 'Rome', lat: 41.9028, lng: 12.4964, minZoom: 6 },
+            { name: 'Madrid', lat: 40.4168, lng: -3.7038, minZoom: 6 },
+            { name: 'Barcelona', lat: 41.3851, lng: 2.1734, minZoom: 6 },
+            { name: 'Amsterdam', lat: 52.3676, lng: 4.9041, minZoom: 6 },
+            { name: 'Vienna', lat: 48.2082, lng: 16.3738, minZoom: 6 },
+            { name: 'Stockholm', lat: 59.3293, lng: 18.0686, minZoom: 6 },
+            { name: 'Oslo', lat: 59.9139, lng: 10.7522, minZoom: 6 },
+            { name: 'Copenhagen', lat: 55.6761, lng: 12.5683, minZoom: 6 },
+            { name: 'Athens', lat: 37.9838, lng: 23.7275, minZoom: 6 },
+            { name: 'Lisbon', lat: 38.7223, lng: -9.1393, minZoom: 6 },
+            { name: 'Brussels', lat: 50.8503, lng: 4.3517, minZoom: 6 },
+            { name: 'Zurich', lat: 47.3769, lng: 8.5417, minZoom: 6 }
+        ];
+        
+        const width = this.displayWidth || this.canvas.width;
+        const height = this.displayHeight || this.canvas.height;
+        
+        this.ctx.font = 'bold 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif';
+        this.ctx.textAlign = 'center';
+        this.ctx.textBaseline = 'middle';
+        
+        for (const city of cities) {
+            if (this.zoom < city.minZoom) continue;
+            
+            const cityPixel = this._latLngToPixel(city.lat, city.lng);
+            const x = cityPixel.x + offsetX;
+            const y = cityPixel.y + offsetY;
+            
+            // Skip if outside viewport
+            if (x < -50 || x > width + 50 || y < -50 || y > height + 50) continue;
+            
+            // Draw city marker dot
+            this.ctx.fillStyle = this.darkMode ? '#ff6b6b' : '#e74c3c';
+            this.ctx.beginPath();
+            this.ctx.arc(x, y, 3, 0, Math.PI * 2);
+            this.ctx.fill();
+            
+            // Draw label with shadow
+            this.ctx.shadowColor = 'rgba(0, 0, 0, 0.8)';
+            this.ctx.shadowBlur = 3;
+            this.ctx.fillStyle = this.darkMode ? '#ffffff' : '#2c3e50';
+            this.ctx.fillText(city.name, x, y - 12);
+            this.ctx.shadowBlur = 0;
+        }
     }
 
     _bindEvents() {
@@ -251,7 +437,7 @@ class AJMap {
                 };
             }
             
-            this._render();
+            this._scheduleRender();
         });
         
         window.addEventListener('mouseup', () => {
@@ -309,14 +495,14 @@ class AJMap {
                     lng: touchStart.center.lng + dLng
                 };
                 
-                this._render();
+                this._scheduleRender();
             }
         });
         
         // Window resize
         window.addEventListener('resize', () => {
             this._setupCanvas();
-            this._render();
+            this._scheduleRender();
         });
     }
 
@@ -624,6 +810,80 @@ class AJMap {
         }
     }
 
+    _renderPlaceLabels(viewportX, viewportY, scale) {
+        // Major world cities with coordinates
+        const majorCities = [
+            { name: 'New York', lat: 40.7128, lng: -74.0060, minZoom: 4 },
+            { name: 'London', lat: 51.5074, lng: -0.1278, minZoom: 4 },
+            { name: 'Paris', lat: 48.8566, lng: 2.3522, minZoom: 4 },
+            { name: 'Tokyo', lat: 35.6762, lng: 139.6503, minZoom: 4 },
+            { name: 'Sydney', lat: -33.8688, lng: 151.2093, minZoom: 4 },
+            { name: 'Dubai', lat: 25.2048, lng: 55.2708, minZoom: 4 },
+            { name: 'Singapore', lat: 1.3521, lng: 103.8198, minZoom: 4 },
+            { name: 'Los Angeles', lat: 34.0522, lng: -118.2437, minZoom: 5 },
+            { name: 'Chicago', lat: 41.8781, lng: -87.6298, minZoom: 5 },
+            { name: 'Toronto', lat: 43.6532, lng: -79.3832, minZoom: 5 },
+            { name: 'Berlin', lat: 52.5200, lng: 13.4050, minZoom: 5 },
+            { name: 'Moscow', lat: 55.7558, lng: 37.6173, minZoom: 5 },
+            { name: 'Beijing', lat: 39.9042, lng: 116.4074, minZoom: 5 },
+            { name: 'Shanghai', lat: 31.2304, lng: 121.4737, minZoom: 5 },
+            { name: 'Mumbai', lat: 19.0760, lng: 72.8777, minZoom: 5 },
+            { name: 'Delhi', lat: 28.7041, lng: 77.1025, minZoom: 5 },
+            { name: 'São Paulo', lat: -23.5505, lng: -46.6333, minZoom: 5 },
+            { name: 'Mexico City', lat: 19.4326, lng: -99.1332, minZoom: 5 },
+            { name: 'Cairo', lat: 30.0444, lng: 31.2357, minZoom: 5 },
+            { name: 'Istanbul', lat: 41.0082, lng: 28.9784, minZoom: 5 },
+            { name: 'Bangkok', lat: 13.7563, lng: 100.5018, minZoom: 5 },
+            { name: 'Hong Kong', lat: 22.3193, lng: 114.1694, minZoom: 5 },
+            { name: 'Seoul', lat: 37.5665, lng: 126.9780, minZoom: 5 },
+            { name: 'Madrid', lat: 40.4168, lng: -3.7038, minZoom: 6 },
+            { name: 'Rome', lat: 41.9028, lng: 12.4964, minZoom: 6 },
+            { name: 'Amsterdam', lat: 52.3676, lng: 4.9041, minZoom: 6 },
+            { name: 'Barcelona', lat: 41.3851, lng: 2.1734, minZoom: 6 },
+            { name: 'Vienna', lat: 48.2082, lng: 16.3738, minZoom: 6 },
+            { name: 'Prague', lat: 50.0755, lng: 14.4378, minZoom: 6 },
+            { name: 'Warsaw', lat: 52.2297, lng: 21.0122, minZoom: 6 },
+            { name: 'Athens', lat: 37.9838, lng: 23.7275, minZoom: 6 },
+            { name: 'Lisbon', lat: 38.7223, lng: -9.1393, minZoom: 6 },
+            { name: 'Stockholm', lat: 59.3293, lng: 18.0686, minZoom: 6 },
+            { name: 'Copenhagen', lat: 55.6761, lng: 12.5683, minZoom: 6 },
+            { name: 'Oslo', lat: 59.9139, lng: 10.7522, minZoom: 6 },
+            { name: 'Helsinki', lat: 60.1695, lng: 24.9354, minZoom: 6 },
+            { name: 'Brussels', lat: 50.8503, lng: 4.3517, minZoom: 6 },
+            { name: 'Zurich', lat: 47.3769, lng: 8.5417, minZoom: 6 }
+        ];
+        
+        this.ctx.font = 'bold 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif';
+        this.ctx.textAlign = 'center';
+        this.ctx.textBaseline = 'middle';
+        
+        for (const city of majorCities) {
+            if (this.zoom < city.minZoom) continue;
+            
+            const cityX = this._lngToX(city.lng) * scale * this.options.tileSize - viewportX;
+            const cityY = this._latToY(city.lat) * scale * this.options.tileSize - viewportY;
+            
+            // Only render if visible
+            if (cityX < -50 || cityX > this.displayWidth + 50 || 
+                cityY < -50 || cityY > this.displayHeight + 50) {
+                continue;
+            }
+            
+            // Draw city dot
+            this.ctx.fillStyle = this.darkMode ? '#ff6b6b' : '#e74c3c';
+            this.ctx.beginPath();
+            this.ctx.arc(cityX, cityY, 3, 0, Math.PI * 2);
+            this.ctx.fill();
+            
+            // Draw label with shadow for readability
+            this.ctx.shadowColor = 'rgba(0, 0, 0, 0.7)';
+            this.ctx.shadowBlur = 4;
+            this.ctx.fillStyle = this.darkMode ? '#ffffff' : '#2c3e50';
+            this.ctx.fillText(city.name, cityX, cityY - 10);
+            this.ctx.shadowBlur = 0;
+        }
+    }
+    
     _updateMarkers() {
         this.markers.forEach(marker => {
             const pixel = this._latLngToPixel(marker.lat, marker.lng);
@@ -654,7 +914,7 @@ class AJMap {
         
         const marker = { lat, lng, title, description, element: markerEl };
         this.markers.push(marker);
-        this._render();
+        this._scheduleRender();
         
         return marker;
     }
@@ -662,20 +922,20 @@ class AJMap {
     setView(lat, lng, zoom) {
         this.center = { lat, lng };
         if (zoom !== undefined) this.zoom = Math.max(this.options.minZoom, Math.min(this.options.maxZoom, zoom));
-        this._render();
+        this._scheduleRender();
     }
 
     zoomIn() {
         if (this.zoom < this.options.maxZoom) {
             this.zoom++;
-            this._render();
+            this._scheduleRender();
         }
     }
 
     zoomOut() {
         if (this.zoom > this.options.minZoom) {
             this.zoom--;
-            this._render();
+            this._scheduleRender();
         }
     }
 
@@ -683,7 +943,7 @@ class AJMap {
         this.darkMode = !this.darkMode;
         const container = document.getElementById(this.containerId);
         container.classList.toggle('aj-dark-mode');
-        this._render();
+        this._scheduleRender();
     }
 
     clearMarkers() {
@@ -693,7 +953,7 @@ class AJMap {
 
     clearRoute() {
         this.routePolyline = null;
-        this._render();
+        this._scheduleRender();
     }
 
     // 3D Mode Methods
@@ -710,7 +970,7 @@ class AJMap {
         }
         
         this.tiles.clear();
-        this._render();
+        this._scheduleRender();
     }
 
     _render3D() {
@@ -870,12 +1130,12 @@ class AJMap {
 
     setPitch(angle) {
         this.pitch = Math.max(0, Math.min(60, angle));
-        this._render();
+        this._scheduleRender();
     }
 
     setBearing(angle) {
         this.bearing = angle % 360;
-        this._render();
+        this._scheduleRender();
     }
 
     rotateTo(bearing, duration = 1000) {
@@ -887,8 +1147,10 @@ class AJMap {
             const elapsed = Date.now() - startTime;
             const progress = Math.min(elapsed / duration, 1);
             
-            this.bearing = start + (end - start) * progress;
-            this._render();
+            // Use easing for smooth animation
+            const eased = progress < 0.5 ? 2 * progress * progress : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+            this.bearing = start + (end - start) * eased;
+            this._render(); // Direct render for smooth 60fps animation
             
             if (progress < 1) {
                 requestAnimationFrame(animate);

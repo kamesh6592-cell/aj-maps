@@ -41,16 +41,18 @@ class AJMap {
             return;
         }
         
+        // Set explicit positioning
+        container.style.position = container.style.position || 'relative';
         container.classList.add('aj-map-container');
         container.innerHTML = ''; // Clear container
         
         // Create canvas for map tiles
         this.canvas = document.createElement('canvas');
         this.canvas.className = 'aj-map-canvas';
-        this.canvas.style.cssText = 'position: absolute; top: 0; left: 0; cursor: grab;';
+        this.canvas.style.cssText = 'position: absolute; top: 0; left: 0; width: 100%; height: 100%; cursor: grab;';
         container.appendChild(this.canvas);
         
-        this.ctx = this.canvas.getContext('2d');
+        this.ctx = this.canvas.getContext('2d', { alpha: false, desynchronized: true });
         
         // Create overlay container for markers/UI
         this.overlay = document.createElement('div');
@@ -63,13 +65,26 @@ class AJMap {
         this._addBranding();
         this._initContextMenu();
         this._bindEvents();
-        this._render();
+        
+        // Ensure first render happens after setup
+        requestAnimationFrame(() => this._render());
     }
 
     _setupCanvas() {
         const container = document.getElementById(this.containerId);
-        this.canvas.width = container.clientWidth;
-        this.canvas.height = container.clientHeight;
+        const dpr = window.devicePixelRatio || 1;
+        const rect = container.getBoundingClientRect();
+        
+        this.canvas.width = rect.width * dpr;
+        this.canvas.height = rect.height * dpr;
+        this.canvas.style.width = rect.width + 'px';
+        this.canvas.style.height = rect.height + 'px';
+        
+        this.ctx.scale(dpr, dpr);
+        
+        // Store display dimensions
+        this.displayWidth = rect.width;
+        this.displayHeight = rect.height;
     }
 
     // Web Mercator Projection
@@ -135,7 +150,10 @@ class AJMap {
     }
 
     _render() {
-        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        const width = this.displayWidth || this.canvas.width;
+        const height = this.displayHeight || this.canvas.height;
+        
+        this.ctx.clearRect(0, 0, width, height);
         
         // Apply dark mode filter
         if (this.darkMode) {
@@ -150,14 +168,17 @@ class AJMap {
         }
         
         const centerPixel = this._latLngToPixel(this.center.lat, this.center.lng);
-        const offsetX = this.canvas.width / 2 - centerPixel.x;
-        const offsetY = this.canvas.height / 2 - centerPixel.y;
+        const offsetX = width / 2 - centerPixel.x;
+        const offsetY = height / 2 - centerPixel.y;
+        
+        const width = this.displayWidth || this.canvas.width;
+        const height = this.displayHeight || this.canvas.height;
         
         const numTiles = Math.pow(2, this.zoom);
-        const startTileX = Math.floor((centerPixel.x - this.canvas.width / 2) / this.options.tileSize);
-        const startTileY = Math.floor((centerPixel.y - this.canvas.height / 2) / this.options.tileSize);
-        const endTileX = Math.ceil((centerPixel.x + this.canvas.width / 2) / this.options.tileSize);
-        const endTileY = Math.ceil((centerPixel.y + this.canvas.height / 2) / this.options.tileSize);
+        const startTileX = Math.floor((centerPixel.x - width / 2) / this.options.tileSize);
+        const startTileY = Math.floor((centerPixel.y - height / 2) / this.options.tileSize);
+        const endTileX = Math.ceil((centerPixel.x + width / 2) / this.options.tileSize);
+        const endTileY = Math.ceil((centerPixel.y + height / 2) / this.options.tileSize);
         
         // Draw base layer
         for (let ty = startTileY; ty <= endTileY; ty++) {
@@ -570,6 +591,9 @@ class AJMap {
     _updateRoute() {
         if (!this.routePolyline) return;
         
+        const width = this.displayWidth || this.canvas.width;
+        const height = this.displayHeight || this.canvas.height;
+        
         this.ctx.beginPath();
         this.ctx.strokeStyle = '#1a73e8';
         this.ctx.lineWidth = 5;
@@ -579,8 +603,8 @@ class AJMap {
         this.routePolyline.forEach((coord, i) => {
             const pixel = this._latLngToPixel(coord[1], coord[0]);
             const centerPixel = this._latLngToPixel(this.center.lat, this.center.lng);
-            const x = pixel.x - centerPixel.x + this.canvas.width / 2;
-            const y = pixel.y - centerPixel.y + this.canvas.height / 2;
+            const x = pixel.x - centerPixel.x + width / 2;
+            const y = pixel.y - centerPixel.y + height / 2;
             
             if (i === 0) this.ctx.moveTo(x, y);
             else this.ctx.lineTo(x, y);
@@ -694,8 +718,8 @@ class AJMap {
 
     _render3D() {
         const ctx = this.ctx;
-        const width = this.canvas.width;
-        const height = this.canvas.height;
+        const width = this.displayWidth || this.canvas.width;
+        const height = this.displayHeight || this.canvas.height;
         
         // Draw globe background
         const gradient = ctx.createRadialGradient(

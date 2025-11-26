@@ -171,9 +171,6 @@ class AJMap {
         const offsetX = width / 2 - centerPixel.x;
         const offsetY = height / 2 - centerPixel.y;
         
-        const width = this.displayWidth || this.canvas.width;
-        const height = this.displayHeight || this.canvas.height;
-        
         const numTiles = Math.pow(2, this.zoom);
         const startTileX = Math.floor((centerPixel.x - width / 2) / this.options.tileSize);
         const startTileY = Math.floor((centerPixel.y - height / 2) / this.options.tileSize);

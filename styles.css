@@ -1,0 +1,119 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    overflow: hidden;
+}
+
+#map {
+    width: 100vw;
+    height: 100vh;
+}
+
+/* Hide default Leaflet attribution */
+.leaflet-control-attribution {
+    display: none !important;
+}
+
+/* AJ STUDIOZ Branding */
+.aj-branding {
+    position: absolute;
+    bottom: 20px;
+    left: 20px;
+    z-index: 1000;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    padding: 12px 24px;
+    border-radius: 8px;
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+}
+
+.aj-logo {
+    color: white;
+    font-size: 18px;
+    font-weight: bold;
+    letter-spacing: 2px;
+    text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+}
+
+/* Custom Controls */
+.aj-controls {
+    position: absolute;
+    top: 20px;
+    right: 20px;
+    z-index: 1000;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.aj-btn {
+    width: 45px;
+    height: 45px;
+    background: white;
+    border: 2px solid #667eea;
+    border-radius: 8px;
+    font-size: 20px;
+    font-weight: bold;
+    color: #667eea;
+    cursor: pointer;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+    transition: all 0.3s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.aj-btn:hover {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    transform: scale(1.1);
+}
+
+.aj-btn:active {
+    transform: scale(0.95);
+}
+
+/* Custom Marker Popup */
+.leaflet-popup-content-wrapper {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    border-radius: 8px;
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+}
+
+.leaflet-popup-content {
+    margin: 15px;
+    font-size: 14px;
+}
+
+.leaflet-popup-tip {
+    background: #764ba2;
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+    .aj-branding {
+        bottom: 10px;
+        left: 10px;
+        padding: 8px 16px;
+    }
+    
+    .aj-logo {
+        font-size: 14px;
+    }
+    
+    .aj-controls {
+        top: 10px;
+        right: 10px;
+    }
+    
+    .aj-btn {
+        width: 40px;
+        height: 40px;
+        font-size: 18px;
+    }
+}

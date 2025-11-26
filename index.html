@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AJ STUDIOZ Maps - Developer Demo</title>
+    
+    <!-- 1. Include Leaflet CSS (Required dependency) -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    
+    <!-- 2. Include AJ Maps CSS -->
+    <link rel="stylesheet" href="src/aj-maps.css">
+
+    <style>
+        body { margin: 0; padding: 0; }
+        #map-view { width: 100vw; height: 100vh; }
+    </style>
+</head>
+<body>
+
+    <!-- Map Container -->
+    <div id="map-view"></div>
+
+    <!-- 3. Include Leaflet JS (Required dependency) -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    
+    <!-- 4. Include AJ Maps SDK -->
+    <script src="src/aj-maps.js"></script>
+
+    <!-- 5. Initialize Map -->
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            // Initialize the map
+            const map = new AJMap('map-view', {
+                center: [40.7128, -74.0060],
+                zoom: 14
+            });
+
+            // Example: Add a marker programmatically
+            map.addMarker(40.7128, -74.0060, "AJ STUDIOZ HQ", "Welcome to our advanced map service.");
+        });
+    </script>
+</body>
+</html>

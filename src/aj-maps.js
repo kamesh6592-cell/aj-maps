@@ -1,29 +1,34 @@
 /**
- * AJ STUDIOZ Maps SDK
- * A wrapper around Leaflet to provide a Google Maps-like experience.
+ * AJ STUDIOZ Maps SDK v2.0
+ * A complete, standalone mapping engine with no third-party dependencies.
+ * (c) AJ STUDIOZ - All Rights Reserved
  */
 
 class AJMap {
     constructor(containerId, options = {}) {
         this.containerId = containerId;
         this.options = {
-            center: options.center || [40.7128, -74.0060], // Default NYC
+            center: options.center || [40.7128, -74.0060],
             zoom: options.zoom || 13,
-            apiKey: options.apiKey || '', // Placeholder for future use
-            theme: options.theme || 'default'
+            minZoom: options.minZoom || 3,
+            maxZoom: options.maxZoom || 19,
+            tileSize: 256
         };
         
-        this.map = null;
-        this.layers = {};
+        this.zoom = this.options.zoom;
+        this.center = { lat: this.options.center[0], lng: this.options.center[1] };
+        this.isDragging = false;
+        this.dragStart = null;
+        this.tiles = new Map();
+        this.markers = [];
         this.currentLayer = 'streets';
-        this.routeLayer = null;
-        this.contextMenu = null;
+        this.routePolyline = null;
+        this.darkMode = false;
         
         this.init();
     }
 
     init() {
-        // Ensure container exists
         const container = document.getElementById(this.containerId);
         if (!container) {
             console.error(`AJ Maps: Container '${this.containerId}' not found.`);
@@ -31,73 +36,280 @@ class AJMap {
         }
         
         container.classList.add('aj-map-container');
-
-        // Initialize Leaflet Map
-        this.map = L.map(this.containerId, {
-            zoomControl: false, // We will add custom controls
-            attributionControl: false
-        }).setView(this.options.center, this.options.zoom);
-
-        // Define Layers
-        this.layers.streets = L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
-            maxZoom: 20
-        });
-
-        // Satellite with Labels (Hybrid)
-        const satImg = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-            maxZoom: 19
-        });
-        const satLabels = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
-            maxZoom: 19
-        });
-        this.layers.satellite = L.layerGroup([satImg, satLabels]);
-
-        // Add default layer
-        this.layers.streets.addTo(this.map);
-
-        // Add UI Components
+        container.innerHTML = ''; // Clear container
+        
+        // Create canvas for map tiles
+        this.canvas = document.createElement('canvas');
+        this.canvas.className = 'aj-map-canvas';
+        this.canvas.style.cssText = 'position: absolute; top: 0; left: 0; cursor: grab;';
+        container.appendChild(this.canvas);
+        
+        this.ctx = this.canvas.getContext('2d');
+        
+        // Create overlay container for markers/UI
+        this.overlay = document.createElement('div');
+        this.overlay.className = 'aj-map-overlay';
+        this.overlay.style.cssText = 'position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;';
+        container.appendChild(this.overlay);
+        
+        this._setupCanvas();
         this._addUI();
         this._addBranding();
         this._initContextMenu();
+        this._bindEvents();
+        this._render();
+    }
+
+    _setupCanvas() {
+        const container = document.getElementById(this.containerId);
+        this.canvas.width = container.clientWidth;
+        this.canvas.height = container.clientHeight;
+    }
+
+    // Web Mercator Projection
+    _latToY(lat) {
+        const sin = Math.sin(lat * Math.PI / 180);
+        const y = 0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI);
+        return y;
+    }
+
+    _lngToX(lng) {
+        return (lng + 180) / 360;
+    }
+
+    _pixelToLat(y) {
+        const n = Math.PI - 2 * Math.PI * y / (Math.pow(2, this.zoom) * this.options.tileSize);
+        return (180 / Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n))));
+    }
+
+    _pixelToLng(x) {
+        return x / (Math.pow(2, this.zoom) * this.options.tileSize) * 360 - 180;
+    }
+
+    _latLngToPixel(lat, lng) {
+        const scale = Math.pow(2, this.zoom) * this.options.tileSize;
+        const x = this._lngToX(lng) * scale;
+        const y = this._latToY(lat) * scale;
+        return { x, y };
+    }
+
+    _getTileURL(x, y, z, layer = 'streets') {
+        const servers = ['a', 'b', 'c'];
+        const s = servers[Math.abs(x + y) % 3];
+        
+        if (layer === 'satellite') {
+            return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+        } else if (layer === 'labels') {
+            return `https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/${z}/${y}/${x}`;
+        } else {
+            return `https://${s}.basemaps.cartocdn.com/rastertiles/voyager/${z}/${x}/${y}.png`;
+        }
+    }
+
+    _loadTile(x, y, z, layer) {
+        const key = `${layer}-${z}-${x}-${y}`;
+        
+        if (this.tiles.has(key)) {
+            return this.tiles.get(key);
+        }
+        
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.src = this._getTileURL(x, y, z, layer);
+        
+        const tileData = { img, loaded: false };
+        this.tiles.set(key, tileData);
+        
+        img.onload = () => {
+            tileData.loaded = true;
+            this._render();
+        };
+        
+        return tileData;
+    }
+
+    _render() {
+        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        
+        // Apply dark mode filter
+        if (this.darkMode) {
+            this.ctx.filter = 'invert(1) hue-rotate(180deg) brightness(0.8) contrast(1.2)';
+        } else {
+            this.ctx.filter = 'none';
+        }
+        
+        const centerPixel = this._latLngToPixel(this.center.lat, this.center.lng);
+        const offsetX = this.canvas.width / 2 - centerPixel.x;
+        const offsetY = this.canvas.height / 2 - centerPixel.y;
+        
+        const numTiles = Math.pow(2, this.zoom);
+        const startTileX = Math.floor((centerPixel.x - this.canvas.width / 2) / this.options.tileSize);
+        const startTileY = Math.floor((centerPixel.y - this.canvas.height / 2) / this.options.tileSize);
+        const endTileX = Math.ceil((centerPixel.x + this.canvas.width / 2) / this.options.tileSize);
+        const endTileY = Math.ceil((centerPixel.y + this.canvas.height / 2) / this.options.tileSize);
+        
+        // Draw base layer
+        for (let ty = startTileY; ty <= endTileY; ty++) {
+            for (let tx = startTileX; tx <= endTileX; tx++) {
+                if (tx < 0 || tx >= numTiles || ty < 0 || ty >= numTiles) continue;
+                
+                const tile = this._loadTile(tx, ty, this.zoom, this.currentLayer);
+                if (tile.loaded) {
+                    const x = tx * this.options.tileSize + offsetX;
+                    const y = ty * this.options.tileSize + offsetY;
+                    this.ctx.drawImage(tile.img, x, y, this.options.tileSize, this.options.tileSize);
+                }
+            }
+        }
+        
+        // Draw labels if satellite mode
+        if (this.currentLayer === 'satellite') {
+            for (let ty = startTileY; ty <= endTileY; ty++) {
+                for (let tx = startTileX; tx <= endTileX; tx++) {
+                    if (tx < 0 || tx >= numTiles || ty < 0 || ty >= numTiles) continue;
+                    
+                    const labelTile = this._loadTile(tx, ty, this.zoom, 'labels');
+                    if (labelTile.loaded) {
+                        const x = tx * this.options.tileSize + offsetX;
+                        const y = ty * this.options.tileSize + offsetY;
+                        this.ctx.drawImage(labelTile.img, x, y, this.options.tileSize, this.options.tileSize);
+                    }
+                }
+            }
+        }
+        
+        this.ctx.filter = 'none';
+        
+        // Update marker positions
+        this._updateMarkers();
+        this._updateRoute();
+    }
+
+    _bindEvents() {
+        // Mouse drag
+        this.canvas.addEventListener('mousedown', (e) => {
+            this.isDragging = true;
+            this.dragStart = { x: e.clientX, y: e.clientY, center: { ...this.center } };
+            this.canvas.style.cursor = 'grabbing';
+        });
+        
+        window.addEventListener('mousemove', (e) => {
+            if (!this.isDragging) return;
+            
+            const dx = e.clientX - this.dragStart.x;
+            const dy = e.clientY - this.dragStart.y;
+            
+            const scale = Math.pow(2, this.zoom) * this.options.tileSize;
+            const dLng = -dx / scale * 360;
+            const centerY = this._latToY(this.dragStart.center.lat) + dy / scale;
+            const dLat = this._pixelToLat(centerY * Math.pow(2, this.zoom) * this.options.tileSize);
+            
+            this.center = {
+                lat: dLat,
+                lng: this.dragStart.center.lng + dLng
+            };
+            
+            this._render();
+        });
+        
+        window.addEventListener('mouseup', () => {
+            this.isDragging = false;
+            this.canvas.style.cursor = 'grab';
+        });
+        
+        // Mouse wheel zoom
+        this.canvas.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            const rect = this.canvas.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left;
+            const mouseY = e.clientY - rect.top;
+            
+            const oldZoom = this.zoom;
+            this.zoom = Math.max(this.options.minZoom, Math.min(this.options.maxZoom, this.zoom + (e.deltaY < 0 ? 1 : -1)));
+            
+            if (oldZoom !== this.zoom) {
+                // Zoom to mouse position
+                const centerPixel = this._latLngToPixel(this.center.lat, this.center.lng);
+                const offsetX = this.canvas.width / 2 - centerPixel.x;
+                const offsetY = this.canvas.height / 2 - centerPixel.y;
+                
+                const worldX = mouseX - offsetX;
+                const worldY = mouseY - offsetY;
+                
+                const mouseLat = this._pixelToLat(worldY);
+                const mouseLng = this._pixelToLng(worldX);
+                
+                this._render();
+            }
+        });
+        
+        // Touch support
+        let touchStart = null;
+        this.canvas.addEventListener('touchstart', (e) => {
+            if (e.touches.length === 1) {
+                touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY, center: { ...this.center } };
+            }
+        });
+        
+        this.canvas.addEventListener('touchmove', (e) => {
+            e.preventDefault();
+            if (e.touches.length === 1 && touchStart) {
+                const dx = e.touches[0].clientX - touchStart.x;
+                const dy = e.touches[0].clientY - touchStart.y;
+                
+                const scale = Math.pow(2, this.zoom) * this.options.tileSize;
+                const dLng = -dx / scale * 360;
+                const centerY = this._latToY(touchStart.center.lat) + dy / scale;
+                const dLat = this._pixelToLat(centerY * Math.pow(2, this.zoom) * this.options.tileSize);
+                
+                this.center = {
+                    lat: dLat,
+                    lng: touchStart.center.lng + dLng
+                };
+                
+                this._render();
+            }
+        });
+        
+        // Window resize
+        window.addEventListener('resize', () => {
+            this._setupCanvas();
+            this._render();
+        });
     }
 
     _addUI() {
         const container = document.getElementById(this.containerId);
-
-        // 0. Sidebar
+        
+        // Sidebar
         const sidebar = document.createElement('div');
         sidebar.className = 'aj-sidebar';
         sidebar.id = `${this.containerId}-sidebar`;
-        sidebar.innerHTML = `
-            <div class="aj-sidebar-content" id="${this.containerId}-sidebar-content"></div>
-        `;
+        sidebar.innerHTML = `<div class="aj-sidebar-content" id="${this.containerId}-sidebar-content"></div>`;
         container.appendChild(sidebar);
-
-        // 1. Search Box
+        
+        // Search Box
         const searchBox = document.createElement('div');
         searchBox.className = 'aj-search-box';
         searchBox.innerHTML = `
             <span class="aj-search-icon" id="${this.containerId}-menu-btn">☰</span>
             <input type="text" class="aj-search-input" placeholder="Search AJ Maps" id="${this.containerId}-search">
-            <span class="aj-search-icon" id="${this.containerId}-search-btn" style="font-size: 16px;">🔍</span>
+            <span class="aj-search-icon" id="${this.containerId}-search-btn">🔍</span>
         `;
         container.appendChild(searchBox);
-
-        // Toggle Sidebar on Menu Click
+        
         document.getElementById(`${this.containerId}-menu-btn`).onclick = () => {
             sidebar.classList.toggle('open');
         };
-
-        // Search Functionality (using Nominatim)
+        
         const input = searchBox.querySelector('input');
         let debounceTimer;
-        
         input.addEventListener('input', (e) => {
             clearTimeout(debounceTimer);
             debounceTimer = setTimeout(() => this._performSearch(e.target.value), 500);
         });
-
-        // 2. Controls (Zoom & Location & Dark Mode)
+        
+        // Controls
         const controls = document.createElement('div');
         controls.className = 'aj-controls-container';
         controls.innerHTML = `
@@ -107,22 +319,17 @@ class AJMap {
             <button class="aj-fab" id="${this.containerId}-out" title="Zoom Out">−</button>
         `;
         container.appendChild(controls);
-
-        // Bind Control Events
-        document.getElementById(`${this.containerId}-in`).onclick = () => this.map.zoomIn();
-        document.getElementById(`${this.containerId}-out`).onclick = () => this.map.zoomOut();
+        
+        document.getElementById(`${this.containerId}-in`).onclick = () => this.zoomIn();
+        document.getElementById(`${this.containerId}-out`).onclick = () => this.zoomOut();
         document.getElementById(`${this.containerId}-loc`).onclick = () => this._locateUser();
-        document.getElementById(`${this.containerId}-mode`).onclick = () => {
-            container.classList.toggle('aj-dark-mode');
-        };
-
-        // 3. Layer Switcher (Satellite/Map)
+        document.getElementById(`${this.containerId}-mode`).onclick = () => this.toggleDarkMode();
+        
+        // Layer Switcher
         const layerSwitch = document.createElement('div');
         layerSwitch.className = 'aj-layer-switch';
-        // Set initial background to satellite because clicking it switches TO satellite
         layerSwitch.style.backgroundImage = "url('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/5/10/10')";
         layerSwitch.innerHTML = `<div class="aj-layer-label">Satellite</div>`;
-        
         layerSwitch.onclick = () => this._toggleLayer(layerSwitch);
         container.appendChild(layerSwitch);
     }
@@ -133,15 +340,26 @@ class AJMap {
         menu.className = 'aj-context-menu';
         menu.id = `${this.containerId}-context-menu`;
         container.appendChild(menu);
-        this.contextMenu = menu;
-
-        let clickLatlng = null;
-
-        this.map.on('contextmenu', (e) => {
-            clickLatlng = e.latlng;
+        
+        this.canvas.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            const rect = this.canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            
+            const centerPixel = this._latLngToPixel(this.center.lat, this.center.lng);
+            const offsetX = this.canvas.width / 2 - centerPixel.x;
+            const offsetY = this.canvas.height / 2 - centerPixel.y;
+            
+            const worldX = x - offsetX;
+            const worldY = y - offsetY;
+            
+            const clickLat = this._pixelToLat(worldY);
+            const clickLng = this._pixelToLng(worldX);
+            
             menu.style.display = 'block';
-            menu.style.left = `${e.containerPoint.x}px`;
-            menu.style.top = `${e.containerPoint.y}px`;
+            menu.style.left = `${e.clientX}px`;
+            menu.style.top = `${e.clientY}px`;
             
             menu.innerHTML = `
                 <div class="aj-context-item" id="${this.containerId}-ctx-here">
@@ -154,22 +372,22 @@ class AJMap {
                     <span>❓</span> What's here?
                 </div>
             `;
-
+            
             document.getElementById(`${this.containerId}-ctx-here`).onclick = () => {
-                this._showDirectionsPanel(null, clickLatlng);
+                this._showDirectionsPanel(null, { lat: clickLat, lng: clickLng });
                 menu.style.display = 'none';
             };
             document.getElementById(`${this.containerId}-ctx-center`).onclick = () => {
-                this.map.setView(clickLatlng, this.map.getZoom());
+                this.setView(clickLat, clickLng, this.zoom);
                 menu.style.display = 'none';
             };
             document.getElementById(`${this.containerId}-ctx-what`).onclick = () => {
-                this._reverseGeocode(clickLatlng);
+                this._reverseGeocode(clickLat, clickLng);
                 menu.style.display = 'none';
             };
         });
-
-        this.map.on('click', () => {
+        
+        this.canvas.addEventListener('click', () => {
             menu.style.display = 'none';
         });
     }
@@ -184,18 +402,16 @@ class AJMap {
 
     _toggleLayer(btn) {
         if (this.currentLayer === 'streets') {
-            this.map.removeLayer(this.layers.streets);
-            this.layers.satellite.addTo(this.map);
             this.currentLayer = 'satellite';
             btn.style.backgroundImage = "url('https://a.basemaps.cartocdn.com/rastertiles/voyager/5/10/10.png')";
             btn.querySelector('.aj-layer-label').innerText = "Map";
         } else {
-            this.map.removeLayer(this.layers.satellite);
-            this.layers.streets.addTo(this.map);
             this.currentLayer = 'streets';
             btn.style.backgroundImage = "url('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/5/10/10')";
             btn.querySelector('.aj-layer-label').innerText = "Satellite";
         }
+        this.tiles.clear();
+        this._render();
     }
 
     _locateUser() {
@@ -203,7 +419,7 @@ class AJMap {
         
         navigator.geolocation.getCurrentPosition(pos => {
             const { latitude, longitude } = pos.coords;
-            this.map.setView([latitude, longitude], 16);
+            this.setView(latitude, longitude, 16);
             this.addMarker(latitude, longitude, "You are here");
         });
     }
@@ -213,17 +429,17 @@ class AJMap {
         const content = document.getElementById(`${this.containerId}-sidebar-content`);
         
         if (!query || query.length < 3) return;
-
+        
         sidebar.classList.add('open');
         content.innerHTML = '<div style="padding:20px; text-align:center;">Searching...</div>';
-
+        
         try {
             const response = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`);
             const data = await response.json();
-
+            
             content.innerHTML = '<div class="aj-search-results"></div>';
             const resultsDiv = content.querySelector('.aj-search-results');
-
+            
             if (data.length > 0) {
                 data.forEach(item => {
                     const div = document.createElement('div');
@@ -232,7 +448,7 @@ class AJMap {
                     div.onclick = () => {
                         const lat = parseFloat(item.lat);
                         const lon = parseFloat(item.lon);
-                        this.map.setView([lat, lon], 16);
+                        this.setView(lat, lon, 16);
                         this.addMarker(lat, lon, item.display_name.split(',')[0]);
                         this._showPlaceDetails(item);
                     };
@@ -268,7 +484,7 @@ class AJMap {
         const sidebar = document.getElementById(`${this.containerId}-sidebar`);
         const content = document.getElementById(`${this.containerId}-sidebar-content`);
         sidebar.classList.add('open');
-
+        
         content.innerHTML = `
             <div class="aj-directions-panel">
                 <h3>Directions</h3>
@@ -278,56 +494,44 @@ class AJMap {
             </div>
             <div id="${this.containerId}-route-info" style="padding:10px;"></div>
         `;
-
+        
         document.getElementById(`${this.containerId}-get-route`).onclick = () => {
             this._calculateRoute(end);
         };
     }
 
     async _calculateRoute(endCoords) {
-        // For demo, we assume start is user location or map center if "My Location"
-        // In a real app, we'd geocode the input strings.
-        
         let startCoords;
         
-        // Simple promise wrapper for geolocation
         const getPos = () => new Promise((resolve) => {
             navigator.geolocation.getCurrentPosition(
                 pos => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
-                () => resolve(this.map.getCenter()) // Fallback
+                () => resolve(this.center)
             );
         });
-
+        
         startCoords = await getPos();
         
         if (!endCoords) return alert("Please select a destination");
-
-        // OSRM API
+        
         const url = `https://router.project-osrm.org/route/v1/driving/${startCoords.lng},${startCoords.lat};${endCoords.lng},${endCoords.lat}?overview=full&geometries=geojson`;
-
+        
         try {
             const resp = await fetch(url);
             const data = await resp.json();
-
+            
             if (data.routes && data.routes.length > 0) {
                 const route = data.routes[0];
-                const geojson = route.geometry;
-
-                if (this.routeLayer) this.map.removeLayer(this.routeLayer);
+                this.routePolyline = route.geometry.coordinates;
+                this._render();
                 
-                this.routeLayer = L.geoJSON(geojson, {
-                    style: { color: '#1a73e8', weight: 5, opacity: 0.7 }
-                }).addTo(this.map);
-
-                this.map.fitBounds(this.routeLayer.getBounds(), { padding: [50, 50] });
-
                 const duration = Math.round(route.duration / 60);
                 const distance = (route.distance / 1000).toFixed(1);
                 
                 document.getElementById(`${this.containerId}-route-info`).innerHTML = `
                     <div style="margin-top:10px; padding:10px; background:#e8f0fe; border-radius:8px;">
                         <strong>${duration} min</strong> (${distance} km)<br>
-                        Fastest route now due to traffic conditions.
+                        Fastest route now.
                     </div>
                 `;
             }
@@ -337,39 +541,112 @@ class AJMap {
         }
     }
 
-    async _reverseGeocode(latlng) {
+    _updateRoute() {
+        if (!this.routePolyline) return;
+        
+        this.ctx.beginPath();
+        this.ctx.strokeStyle = '#1a73e8';
+        this.ctx.lineWidth = 5;
+        this.ctx.lineCap = 'round';
+        this.ctx.lineJoin = 'round';
+        
+        this.routePolyline.forEach((coord, i) => {
+            const pixel = this._latLngToPixel(coord[1], coord[0]);
+            const centerPixel = this._latLngToPixel(this.center.lat, this.center.lng);
+            const x = pixel.x - centerPixel.x + this.canvas.width / 2;
+            const y = pixel.y - centerPixel.y + this.canvas.height / 2;
+            
+            if (i === 0) this.ctx.moveTo(x, y);
+            else this.ctx.lineTo(x, y);
+        });
+        
+        this.ctx.stroke();
+    }
+
+    async _reverseGeocode(lat, lng) {
         const sidebar = document.getElementById(`${this.containerId}-sidebar`);
         sidebar.classList.add('open');
         
         try {
-            const resp = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${latlng.lat}&lon=${latlng.lng}`);
+            const resp = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}`);
             const data = await resp.json();
             this._showPlaceDetails(data);
-            this.addMarker(latlng.lat, latlng.lng, "Selected Location");
+            this.addMarker(lat, lng, "Selected Location");
         } catch (e) {
             console.error(e);
         }
     }
 
+    _updateMarkers() {
+        this.markers.forEach(marker => {
+            const pixel = this._latLngToPixel(marker.lat, marker.lng);
+            const centerPixel = this._latLngToPixel(this.center.lat, this.center.lng);
+            const x = pixel.x - centerPixel.x + this.canvas.width / 2;
+            const y = pixel.y - centerPixel.y + this.canvas.height / 2;
+            
+            marker.element.style.left = `${x - 15}px`;
+            marker.element.style.top = `${y - 42}px`;
+        });
+    }
+
     // Public API Methods
     
     addMarker(lat, lng, title = '', description = '') {
-        const icon = L.divIcon({
-            className: 'custom-div-icon',
-            html: "<div class='aj-marker-pin'></div>",
-            iconSize: [30, 42],
-            iconAnchor: [15, 42]
-        });
-
-        const marker = L.marker([lat, lng], { icon: icon }).addTo(this.map);
+        const markerEl = document.createElement('div');
+        markerEl.className = 'aj-marker';
+        markerEl.innerHTML = `<div class="aj-marker-pin"></div>`;
+        markerEl.style.cssText = 'position: absolute; pointer-events: auto; cursor: pointer;';
+        
         if (title) {
-            marker.bindPopup(`<b>${title}</b><br>${description}`);
+            markerEl.onclick = () => {
+                alert(`${title}\n${description}`);
+            };
         }
+        
+        this.overlay.appendChild(markerEl);
+        
+        const marker = { lat, lng, title, description, element: markerEl };
+        this.markers.push(marker);
+        this._render();
+        
         return marker;
     }
 
     setView(lat, lng, zoom) {
-        this.map.setView([lat, lng], zoom);
+        this.center = { lat, lng };
+        if (zoom !== undefined) this.zoom = Math.max(this.options.minZoom, Math.min(this.options.maxZoom, zoom));
+        this._render();
+    }
+
+    zoomIn() {
+        if (this.zoom < this.options.maxZoom) {
+            this.zoom++;
+            this._render();
+        }
+    }
+
+    zoomOut() {
+        if (this.zoom > this.options.minZoom) {
+            this.zoom--;
+            this._render();
+        }
+    }
+
+    toggleDarkMode() {
+        this.darkMode = !this.darkMode;
+        const container = document.getElementById(this.containerId);
+        container.classList.toggle('aj-dark-mode');
+        this._render();
+    }
+
+    clearMarkers() {
+        this.markers.forEach(m => m.element.remove());
+        this.markers = [];
+    }
+
+    clearRoute() {
+        this.routePolyline = null;
+        this._render();
     }
 }
 

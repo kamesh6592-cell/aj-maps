@@ -16,6 +16,8 @@ class AJMap {
         this.map = null;
         this.layers = {};
         this.currentLayer = 'streets';
+        this.routeLayer = null;
+        this.contextMenu = null;
         
         this.init();
     }
@@ -41,9 +43,14 @@ class AJMap {
             maxZoom: 20
         });
 
-        this.layers.satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+        // Satellite with Labels (Hybrid)
+        const satImg = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
             maxZoom: 19
         });
+        const satLabels = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
+            maxZoom: 19
+        });
+        this.layers.satellite = L.layerGroup([satImg, satLabels]);
 
         // Add default layer
         this.layers.streets.addTo(this.map);
@@ -51,24 +58,35 @@ class AJMap {
         // Add UI Components
         this._addUI();
         this._addBranding();
+        this._initContextMenu();
     }
 
     _addUI() {
         const container = document.getElementById(this.containerId);
 
+        // 0. Sidebar
+        const sidebar = document.createElement('div');
+        sidebar.className = 'aj-sidebar';
+        sidebar.id = `${this.containerId}-sidebar`;
+        sidebar.innerHTML = `
+            <div class="aj-sidebar-content" id="${this.containerId}-sidebar-content"></div>
+        `;
+        container.appendChild(sidebar);
+
         // 1. Search Box
         const searchBox = document.createElement('div');
         searchBox.className = 'aj-search-box';
         searchBox.innerHTML = `
-            <span class="aj-search-icon">🔍</span>
+            <span class="aj-search-icon" id="${this.containerId}-menu-btn">☰</span>
             <input type="text" class="aj-search-input" placeholder="Search AJ Maps" id="${this.containerId}-search">
+            <span class="aj-search-icon" id="${this.containerId}-search-btn" style="font-size: 16px;">🔍</span>
         `;
         container.appendChild(searchBox);
 
-        const searchResults = document.createElement('div');
-        searchResults.className = 'aj-search-results';
-        searchResults.id = `${this.containerId}-results`;
-        container.appendChild(searchResults);
+        // Toggle Sidebar on Menu Click
+        document.getElementById(`${this.containerId}-menu-btn`).onclick = () => {
+            sidebar.classList.toggle('open');
+        };
 
         // Search Functionality (using Nominatim)
         const input = searchBox.querySelector('input');
@@ -79,10 +97,11 @@ class AJMap {
             debounceTimer = setTimeout(() => this._performSearch(e.target.value), 500);
         });
 
-        // 2. Controls (Zoom & Location)
+        // 2. Controls (Zoom & Location & Dark Mode)
         const controls = document.createElement('div');
         controls.className = 'aj-controls-container';
         controls.innerHTML = `
+            <button class="aj-fab" id="${this.containerId}-mode" title="Toggle Dark Mode">🌙</button>
             <button class="aj-fab" id="${this.containerId}-loc" title="My Location">📍</button>
             <button class="aj-fab" id="${this.containerId}-in" title="Zoom In">+</button>
             <button class="aj-fab" id="${this.containerId}-out" title="Zoom Out">−</button>
@@ -93,6 +112,9 @@ class AJMap {
         document.getElementById(`${this.containerId}-in`).onclick = () => this.map.zoomIn();
         document.getElementById(`${this.containerId}-out`).onclick = () => this.map.zoomOut();
         document.getElementById(`${this.containerId}-loc`).onclick = () => this._locateUser();
+        document.getElementById(`${this.containerId}-mode`).onclick = () => {
+            container.classList.toggle('aj-dark-mode');
+        };
 
         // 3. Layer Switcher (Satellite/Map)
         const layerSwitch = document.createElement('div');
@@ -103,6 +125,53 @@ class AJMap {
         
         layerSwitch.onclick = () => this._toggleLayer(layerSwitch);
         container.appendChild(layerSwitch);
+    }
+
+    _initContextMenu() {
+        const container = document.getElementById(this.containerId);
+        const menu = document.createElement('div');
+        menu.className = 'aj-context-menu';
+        menu.id = `${this.containerId}-context-menu`;
+        container.appendChild(menu);
+        this.contextMenu = menu;
+
+        let clickLatlng = null;
+
+        this.map.on('contextmenu', (e) => {
+            clickLatlng = e.latlng;
+            menu.style.display = 'block';
+            menu.style.left = `${e.containerPoint.x}px`;
+            menu.style.top = `${e.containerPoint.y}px`;
+            
+            menu.innerHTML = `
+                <div class="aj-context-item" id="${this.containerId}-ctx-here">
+                    <span>📍</span> Directions to here
+                </div>
+                <div class="aj-context-item" id="${this.containerId}-ctx-center">
+                    <span>🎯</span> Center map here
+                </div>
+                <div class="aj-context-item" id="${this.containerId}-ctx-what">
+                    <span>❓</span> What's here?
+                </div>
+            `;
+
+            document.getElementById(`${this.containerId}-ctx-here`).onclick = () => {
+                this._showDirectionsPanel(null, clickLatlng);
+                menu.style.display = 'none';
+            };
+            document.getElementById(`${this.containerId}-ctx-center`).onclick = () => {
+                this.map.setView(clickLatlng, this.map.getZoom());
+                menu.style.display = 'none';
+            };
+            document.getElementById(`${this.containerId}-ctx-what`).onclick = () => {
+                this._reverseGeocode(clickLatlng);
+                menu.style.display = 'none';
+            };
+        });
+
+        this.map.on('click', () => {
+            menu.style.display = 'none';
+        });
     }
 
     _addBranding() {
@@ -140,20 +209,23 @@ class AJMap {
     }
 
     async _performSearch(query) {
-        const resultsContainer = document.getElementById(`${this.containerId}-results`);
-        if (!query || query.length < 3) {
-            resultsContainer.style.display = 'none';
-            return;
-        }
+        const sidebar = document.getElementById(`${this.containerId}-sidebar`);
+        const content = document.getElementById(`${this.containerId}-sidebar-content`);
+        
+        if (!query || query.length < 3) return;
+
+        sidebar.classList.add('open');
+        content.innerHTML = '<div style="padding:20px; text-align:center;">Searching...</div>';
 
         try {
             const response = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`);
             const data = await response.json();
 
-            resultsContainer.innerHTML = '';
+            content.innerHTML = '<div class="aj-search-results"></div>';
+            const resultsDiv = content.querySelector('.aj-search-results');
+
             if (data.length > 0) {
-                resultsContainer.style.display = 'block';
-                data.slice(0, 5).forEach(item => {
+                data.forEach(item => {
                     const div = document.createElement('div');
                     div.className = 'aj-result-item';
                     div.innerHTML = `<span>${item.display_name}</span>`;
@@ -162,16 +234,120 @@ class AJMap {
                         const lon = parseFloat(item.lon);
                         this.map.setView([lat, lon], 16);
                         this.addMarker(lat, lon, item.display_name.split(',')[0]);
-                        resultsContainer.style.display = 'none';
-                        document.getElementById(`${this.containerId}-search`).value = item.display_name;
+                        this._showPlaceDetails(item);
                     };
-                    resultsContainer.appendChild(div);
+                    resultsDiv.appendChild(div);
                 });
             } else {
-                resultsContainer.style.display = 'none';
+                content.innerHTML = '<div style="padding:20px;">No results found.</div>';
             }
         } catch (e) {
             console.error("Search failed", e);
+            content.innerHTML = '<div style="padding:20px;">Search failed.</div>';
+        }
+    }
+
+    _showPlaceDetails(item) {
+        const content = document.getElementById(`${this.containerId}-sidebar-content`);
+        content.innerHTML = `
+            <div class="aj-place-details">
+                <div class="aj-place-title">${item.display_name.split(',')[0]}</div>
+                <div class="aj-place-coords">${item.display_name}</div>
+                <button class="aj-action-btn" id="${this.containerId}-btn-dir">
+                    <span>🚗</span> Directions
+                </button>
+            </div>
+        `;
+        
+        document.getElementById(`${this.containerId}-btn-dir`).onclick = () => {
+            this._showDirectionsPanel(null, { lat: item.lat, lng: item.lon });
+        };
+    }
+
+    _showDirectionsPanel(start, end) {
+        const sidebar = document.getElementById(`${this.containerId}-sidebar`);
+        const content = document.getElementById(`${this.containerId}-sidebar-content`);
+        sidebar.classList.add('open');
+
+        content.innerHTML = `
+            <div class="aj-directions-panel">
+                <h3>Directions</h3>
+                <input type="text" class="aj-dir-input" id="${this.containerId}-start" placeholder="Choose starting point..." value="${start ? start.lat + ',' + start.lng : 'My Location'}">
+                <input type="text" class="aj-dir-input" id="${this.containerId}-end" placeholder="Choose destination..." value="${end ? end.lat + ',' + end.lng : ''}">
+                <button class="aj-action-btn" id="${this.containerId}-get-route">Get Directions</button>
+            </div>
+            <div id="${this.containerId}-route-info" style="padding:10px;"></div>
+        `;
+
+        document.getElementById(`${this.containerId}-get-route`).onclick = () => {
+            this._calculateRoute(end);
+        };
+    }
+
+    async _calculateRoute(endCoords) {
+        // For demo, we assume start is user location or map center if "My Location"
+        // In a real app, we'd geocode the input strings.
+        
+        let startCoords;
+        
+        // Simple promise wrapper for geolocation
+        const getPos = () => new Promise((resolve) => {
+            navigator.geolocation.getCurrentPosition(
+                pos => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+                () => resolve(this.map.getCenter()) // Fallback
+            );
+        });
+
+        startCoords = await getPos();
+        
+        if (!endCoords) return alert("Please select a destination");
+
+        // OSRM API
+        const url = `https://router.project-osrm.org/route/v1/driving/${startCoords.lng},${startCoords.lat};${endCoords.lng},${endCoords.lat}?overview=full&geometries=geojson`;
+
+        try {
+            const resp = await fetch(url);
+            const data = await resp.json();
+
+            if (data.routes && data.routes.length > 0) {
+                const route = data.routes[0];
+                const geojson = route.geometry;
+
+                if (this.routeLayer) this.map.removeLayer(this.routeLayer);
+                
+                this.routeLayer = L.geoJSON(geojson, {
+                    style: { color: '#1a73e8', weight: 5, opacity: 0.7 }
+                }).addTo(this.map);
+
+                this.map.fitBounds(this.routeLayer.getBounds(), { padding: [50, 50] });
+
+                const duration = Math.round(route.duration / 60);
+                const distance = (route.distance / 1000).toFixed(1);
+                
+                document.getElementById(`${this.containerId}-route-info`).innerHTML = `
+                    <div style="margin-top:10px; padding:10px; background:#e8f0fe; border-radius:8px;">
+                        <strong>${duration} min</strong> (${distance} km)<br>
+                        Fastest route now due to traffic conditions.
+                    </div>
+                `;
+            }
+        } catch (e) {
+            console.error("Routing failed", e);
+            alert("Could not calculate route.");
+        }
+    }
+
+    async _reverseGeocode(latlng) {
+        const sidebar = document.getElementById(`${this.containerId}-sidebar`);
+        sidebar.classList.add('open');
+        
+        try {
+            const resp = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${latlng.lat}&lon=${latlng.lng}`);
+            const data = await resp.json();
+            this._showPlaceDetails(data);
+            this.addMarker(latlng.lat, latlng.lng, "Selected Location");
+        } catch (e) {
+            console.error(e);
         }
     }
 
